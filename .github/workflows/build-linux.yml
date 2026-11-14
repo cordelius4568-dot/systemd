@@ -1,0 +1,388 @@
+name: Build Linux distro (glibc + BusyBox + systemd fork + xbps)
+
+# Mimari: x86_64 | libc: glibc (hazır Ubuntu 24.04 paketinden çekilir, derlenmez) | userland: BusyBox
+# init: BU DEPODAKİ systemd fork'u (kaynaktan derlenir) | paket yöneticisi: xbps (kaynaktan)
+# çıktı: bzImage, initramfs, ISO, xbps repo
+#
+# Fork'un varsayılanları: journal RAM'de (volatile), coredump journal'a (RAM), yaş doğrulama (birthDate) yok,
+# telemetri/log yükleme yok: journal-upload ve systemd-report bu imajda etkinleştirilmez; sadece yapılandırmaya
+# özel bir URL yazılırsa o sunucuya gider.
+
+on:
+  workflow_dispatch:
+    inputs:
+      distro_name:
+        description: "Dağıtım adı"
+        default: "tinyglibc"
+      kernel_version:
+        description: "Linux kernel sürümü"
+        default: "6.12.10"
+      busybox_version:
+        description: "BusyBox sürümü"
+        default: "1.36.1"
+      xbps_version:
+        description: "xbps sürümü"
+        default: "0.59.2"
+      root_password:
+        description: "root parolası (test için, değiştir!)"
+        default: "root"
+      publish_release:
+        description: "GitHub Release oluştur"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  NAME: ${{ inputs.distro_name }}
+  KVER: ${{ inputs.kernel_version }}
+  BB_VER: ${{ inputs.busybox_version }}
+  XBPS_VER: ${{ inputs.xbps_version }}
+  ROOT_PW: ${{ inputs.root_password }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash -euo pipefail {0}
+    env:
+      WORK: ${{ github.workspace }}/work
+      ROOTFS: ${{ github.workspace }}/rootfs
+      DIST: ${{ github.workspace }}/dist
+
+    steps:
+      - name: Fork kaynağını çek (systemd)
+        uses: actions/checkout@v4
+
+      - name: Build bağımlılıklarını kur
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bison flex gawk gettext texinfo python3 python3-jinja2 rsync bc cpio file \
+            libssl-dev libelf-dev libncurses-dev dwarves libarchive-dev zlib1g-dev \
+            pkg-config xz-utils bzip2 curl ca-certificates \
+            meson ninja-build gperf libcap-dev libmount-dev libblkid-dev libcrypt-dev \
+            grub-pc-bin grub-common xorriso mtools qemu-system-x86
+
+      - name: Kaynak kodları indir (kernel, busybox, xbps)
+        run: |
+          mkdir -p "$WORK" "$DIST"
+          cd "$WORK"
+          major="${KVER%%.*}"
+          curl -fsSLO "https://cdn.kernel.org/pub/linux/kernel/v${major}.x/linux-${KVER}.tar.xz"
+          curl -fsSLO "https://busybox.net/downloads/busybox-${BB_VER}.tar.bz2"
+          curl -fsSL -o "xbps-${XBPS_VER}.tar.gz" \
+            "https://github.com/void-linux/xbps/archive/refs/tags/${XBPS_VER}.tar.gz"
+          for f in *.tar.*; do tar xf "$f"; done
+          ls -la
+
+      - name: Rootfs iskeleti (merged-usr)
+        run: |
+          mkdir -p "$ROOTFS"/{usr/{bin,sbin,lib,share},etc,dev,proc,sys,run,tmp,var/{log,lib,cache},root,home,mnt}
+          cd "$ROOTFS"
+          ln -s usr/bin bin
+          ln -s usr/sbin sbin
+          ln -s usr/lib lib
+          ln -s usr/lib lib64
+          chmod 1777 tmp
+          chmod 700 root
+          touch etc/ld.so.conf
+
+      - name: glibc'yi hazır paketten çek (derleme yok)
+        run: |
+          mkdir -p "$WORK/debs" "$WORK/glibc-x" && cd "$WORK/debs"
+          # Runner ile aynı sürüm (Ubuntu 24.04, glibc 2.39): host'ta derlenen ikililerle birebir uyumlu
+          apt-get download libc6 libcrypt1 libgcc-s1
+          for d in *.deb; do dpkg-deb -x "$d" "$WORK/glibc-x"; done
+          cd "$WORK/glibc-x"
+          [ -d usr ] && cp -a usr/. "$ROOTFS/usr/"
+          [ -d lib ] && cp -a lib/. "$ROOTFS/usr/lib/" || true
+          # dinamik yükleyici yolu: /lib64/ld-linux-x86-64.so.2
+          # Void düzenine uyum: multiarch dizinini /usr/lib'e düzleştir (Void'in glibc paketi temiz üzerine yazabilsin)
+          cd "$ROOTFS/usr/lib"
+          cp -a x86_64-linux-gnu/. .
+          rm -rf x86_64-linux-gnu
+          ln -s . x86_64-linux-gnu
+          printf '/usr/lib\n' > "$ROOTFS/etc/ld.so.conf"
+          ls "$ROOTFS/usr/lib" | head -30
+
+      - name: BusyBox derle (glibc'ye dinamik bağlı)
+        run: |
+          cd "$WORK/busybox-${BB_VER}"
+          make defconfig
+          # yeni kernel header'larıyla derlenmeyen tc applet'ini kapat
+          sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
+          make oldconfig < <(yes "")
+          make -j"$(nproc)"
+          make CONFIG_PREFIX="$ROOTFS" install
+          mkdir -p "$ROOTFS/usr/share/udhcpc"
+          install -m755 examples/udhcp/simple.script "$ROOTFS/usr/share/udhcpc/default.script"
+
+      - name: systemd fork'unu derle (init / servis yöneticisi)
+        run: |
+          # Kaynak: bu depo (checkout). Gereksiz ve ağ/telemetriye açılan özellikler kapalı; man/test yok.
+          meson setup "$WORK/build-systemd" "$GITHUB_WORKSPACE" \
+            --buildtype=release \
+            --prefix=/usr --sysconfdir=/etc --localstatedir=/var --libdir=lib \
+            -Dmode=release -Dlibc=glibc -Dsplit-bin=false \
+            -Dtests=false -Dman=disabled -Dhtml=disabled -Dtranslations=false \
+            -Dcreate-log-dirs=false -Dldconfig=false \
+            -Dfallback-hostname="$NAME" \
+            -Dfallback-default-target=multi-user.target \
+            -Dselinux=disabled -Dapparmor=disabled -Dsmack=false -Dima=false -Dipe=false \
+            -Dpam=disabled -Daudit=disabled -Dseccomp=disabled -Dpolkit=disabled -Dacl=disabled \
+            -Dxkbcommon=disabled -Dpcre2=disabled -Dlibcryptsetup=disabled \
+            -Dlibcryptsetup-plugins=disabled -Dbootloader=disabled -Defi=false -Dukify=disabled \
+            -Dkernel-install=false -Dbpf-framework=disabled -Dtpm2=disabled -Dtpm=false \
+            -Dhomed=disabled -Dnspawn=disabled -Dimportd=disabled -Dremote=disabled \
+            -Dsysupdate=disabled -Drepart=disabled -Dimds=disabled -Dvmspawn=disabled \
+            -Dlibcurl=disabled -Ddbus=disabled -Dkmod=disabled -Delfutils=disabled \
+            -Dlibarchive=disabled -Dqrencode=disabled -Dlibidn2=disabled -Dmicrohttpd=disabled \
+            -Dpasswdqc=disabled -Dpwquality=disabled -Dp11kit=disabled -Dlibfido2=disabled \
+            -Dglib=disabled -Dgnutls=disabled -Dgcrypt=disabled -Dopenssl=disabled
+          meson compile -C "$WORK/build-systemd"
+          meson install -C "$WORK/build-systemd" --no-rebuild --destdir "$ROOTFS"
+
+          cd "$ROOTFS"
+          # BusyBox'ın init/kapatma uygulamalarını systemd'ninkilerle değiştir
+          # (PATH'te /usr/sbin önce geldiği için BusyBox'ınkiler yoksa systemd'yi gölgelerdi)
+          rm -f linuxrc usr/sbin/{init,halt,poweroff,reboot}
+          ln -sf ../lib/systemd/systemd usr/sbin/init
+          ln -sf ../bin/systemctl usr/sbin/halt
+          ln -sf ../bin/systemctl usr/sbin/poweroff
+          ln -sf ../bin/systemctl usr/sbin/reboot
+          ln -sf ../bin/systemctl usr/sbin/shutdown
+          # çekirdeğin çalıştıracağı /init
+          ln -sf usr/lib/systemd/systemd init
+          ls -la init usr/sbin/{init,halt,poweroff,reboot} usr/lib/systemd/systemd
+
+      - name: xbps derle (paket yöneticisi)
+        run: |
+          cd "$WORK/xbps-${XBPS_VER}"
+          ./configure --prefix=/usr --sysconfdir=/etc
+          # OpenSSL 3 deprecation uyarıları -Werror yüzünden hataya dönüyor; -Werror'u kaldır
+          find . \( -name 'config.mk' -o -name 'Makefile' -o -name '*.mk' \) -exec sed -i 's/-Werror//g' {} +
+          make -j"$(nproc)"
+          make DESTDIR="$ROOTFS" install
+          # repo oluşturmak için host'a da kur
+          sudo make install
+          sudo ldconfig
+
+      - name: Sistem yapılandırması (etc, systemd, servisler)
+        run: |
+          cd "$ROOTFS"
+          HASH="$(openssl passwd -6 "$ROOT_PW")"
+
+          echo "$NAME" > etc/hostname
+          cat > etc/os-release <<EOF
+          NAME="$NAME"
+          ID=$NAME
+          PRETTY_NAME="$NAME Linux (glibc/busybox/systemd)"
+          EOF
+          sed -i 's/^ *//' etc/os-release
+          ln -sf ../etc/os-release usr/lib/os-release
+
+          echo "root:x:0:0:root:/root:/bin/sh" > etc/passwd
+          echo "root:${HASH}:19000:0:99999:7:::" > etc/shadow
+          chmod 600 etc/shadow
+          # nobody/tty gid'leri systemd sysusers (basic.conf) ile uyumlu olmalı
+          printf 'root:x:0:\ntty:x:5:\nwheel:x:10:root\nnobody:x:65534:\n' > etc/group
+          printf 'passwd: files systemd\ngroup: files systemd\nshadow: files\nhosts: files dns\n' > etc/nsswitch.conf
+          printf 'nameserver 1.1.1.1\nnameserver 9.9.9.9\n' > etc/resolv.conf
+          printf '/bin/sh\n' > etc/shells
+          : > etc/fstab
+          cat > etc/profile <<'EOF'
+          export PATH=/usr/sbin:/usr/bin
+          export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+          export SSL_CA_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+          export PS1='\u@\h:\w\$ '
+          alias ll='ls -lah'
+          EOF
+          sed -i 's/^ *//' etc/profile
+
+          # xbps yapılandırması (kendi repo veya Void glibc reposu eklenebilir)
+          mkdir -p etc/xbps.d var/db/xbps
+          cat > etc/xbps.d/00-repository.conf <<'EOF'
+          repository=https://repo-default.voidlinux.org/current
+          EOF
+
+          # HTTPS için CA sertifikaları (runner'dan)
+          mkdir -p etc/ssl/certs usr/lib/ssl
+          cp -L /etc/ssl/certs/ca-certificates.crt etc/ssl/certs/ca-certificates.crt
+          cp etc/ssl/certs/ca-certificates.crt etc/ssl/cert.pem
+          ln -sfn /etc/ssl/certs usr/lib/ssl/certs
+          ln -sfn /etc/ssl/cert.pem usr/lib/ssl/cert.pem
+          sed -i 's/^ *//' etc/xbps.d/00-repository.conf
+
+          # --- systemd yapılandırması ---
+          mkdir -p etc/systemd/system etc/systemd/network
+          # boş machine-id: systemd ilk açılışta kendisi üretir
+          : > etc/machine-id
+          # ilk açılış sihirbazı etkileşimli sorular sorar; kapat
+          ln -sf /dev/null etc/systemd/system/systemd-firstboot.service
+          ln -sf /usr/lib/systemd/system/multi-user.target etc/systemd/system/default.target
+
+          # journal: RAM (volatile). Derleme zamanı varsayılanı zaten volatile; burada açıkça da yazılı.
+          mkdir -p etc/systemd/journald.conf.d
+          printf '[Journal]\nStorage=volatile\n' > etc/systemd/journald.conf.d/00-volatile.conf
+
+          # BusyBox getty (util-linux agetty yok): getty şablonlarını geçersiz kıl
+          cat > etc/systemd/system/getty@.service <<'EOF'
+          [Unit]
+          Description=Getty on %I
+          After=systemd-user-sessions.service
+          ConditionPathExists=/dev/%I
+
+          [Service]
+          ExecStart=-/usr/sbin/getty 38400 %I linux
+          Restart=always
+          RestartSec=0
+          TTYPath=/dev/%I
+          TTYReset=yes
+          TTYVHangup=yes
+          IgnoreSIGPIPE=no
+          SendSIGHUP=yes
+
+          [Install]
+          WantedBy=getty.target
+          EOF
+          cat > etc/systemd/system/serial-getty@.service <<'EOF'
+          [Unit]
+          Description=Serial Getty on %I
+          After=systemd-user-sessions.service
+          ConditionPathExists=/dev/%I
+
+          [Service]
+          ExecStart=-/usr/sbin/getty -L 115200 %I vt100
+          Restart=always
+          RestartSec=0
+          TTYPath=/dev/%I
+          TTYReset=yes
+          TTYVHangup=yes
+          IgnoreSIGPIPE=no
+          SendSIGHUP=yes
+
+          [Install]
+          WantedBy=getty.target
+          EOF
+          sed -i 's/^ *//' etc/systemd/system/getty@.service etc/systemd/system/serial-getty@.service
+          mkdir -p etc/systemd/system/getty.target.wants
+          ln -sf /etc/systemd/system/getty@.service etc/systemd/system/getty.target.wants/getty@tty1.service
+          ln -sf /etc/systemd/system/serial-getty@.service etc/systemd/system/getty.target.wants/serial-getty@ttyS0.service
+
+          # DHCP: systemd-networkd
+          cat > etc/systemd/network/80-dhcp.network <<'EOF'
+          [Match]
+          Name=e*
+
+          [Network]
+          DHCP=yes
+          EOF
+          sed -i 's/^ *//' etc/systemd/network/80-dhcp.network
+          mkdir -p etc/systemd/system/multi-user.target.wants etc/systemd/system/sockets.target.wants
+          ln -sf /usr/lib/systemd/system/systemd-networkd.service etc/systemd/system/multi-user.target.wants/systemd-networkd.service
+          ln -sf /usr/lib/systemd/system/systemd-networkd.socket etc/systemd/system/sockets.target.wants/systemd-networkd.socket
+
+          # Bilerek ETKİNLEŞTİRİLMEYENLER (telemetri/ağ): systemd-journal-upload, systemd-journal-remote,
+          # systemd-report, systemd-timesyncd. Yükleme için /etc/systemd/journal-upload.conf içine URL yazılmalı.
+
+      - name: Çalışma zamanı kütüphanelerini topla (systemd/xbps/busybox bağımlılıkları)
+        run: |
+          export LD_LIBRARY_PATH="$ROOTFS/usr/lib/systemd"
+          find "$ROOTFS/usr/bin" "$ROOTFS/usr/sbin" "$ROOTFS/usr/lib/systemd" -type f -perm -u+x | while read -r f; do
+            file -b "$f" | grep -q 'ELF.*dynamically' || continue
+            ldd "$f" 2>/dev/null | awk '/=> \//{print $3}'
+          done | sort -u | while read -r lib; do
+            b="$(basename "$lib")"
+            [ -e "$ROOTFS/usr/lib/$b" ] || [ -e "$ROOTFS/usr/lib/systemd/$b" ] || \
+              install -Dm755 "$(readlink -f "$lib")" "$ROOTFS/usr/lib/$b"
+          done
+          unset LD_LIBRARY_PATH
+          sudo ldconfig -r "$ROOTFS" || true
+          # ldconfig root olarak dosya oluşturdu (var/cache/ldconfig); sahipliği geri ver
+          sudo chown -R "$(id -u):$(id -g)" "$ROOTFS"
+
+      - name: Kernel derle
+        run: |
+          cd "$WORK/linux-${KVER}"
+          make defconfig
+          ./scripts/config -e DEVTMPFS -e DEVTMPFS_MOUNT -e TMPFS -e BLK_DEV_INITRD \
+            -e VIRTIO -e VIRTIO_PCI -e VIRTIO_BLK -e VIRTIO_NET -e EXT4_FS \
+            -e SERIAL_8250 -e SERIAL_8250_CONSOLE -e PROC_FS -e SYSFS \
+            -e CGROUPS -e FHANDLE -e INOTIFY_USER -e SIGNALFD -e TIMERFD -e EPOLL \
+            -e AUTOFS_FS -e TMPFS_POSIX_ACL -e TMPFS_XATTR -e UNIX -e NET \
+            -d UEVENT_HELPER -d DEBUG_INFO_BTF
+          make olddefconfig
+          make -j"$(nproc)" bzImage
+          cp arch/x86/boot/bzImage "$DIST/vmlinuz-${KVER}"
+
+      - name: xbps paket reposu oluştur
+        run: |
+          sudo chown -R 0:0 "$ROOTFS"
+          mkdir -p "$DIST/repo" && cd "$DIST/repo"
+          sudo xbps-create -A x86_64 -n "${NAME}-base-1.0_1" \
+            -s "${NAME} base system" -m "builder <builder@localhost>" \
+            -l "GPL-2.0-only" "$ROOTFS"
+          sudo xbps-rindex -a ./*.xbps
+          sudo chown -R "$USER" "$DIST"
+          ls -la
+
+      - name: initramfs ve ISO oluştur
+        run: |
+          cd "$ROOTFS"
+          sudo mknod -m 622 dev/console c 5 1
+          sudo mknod -m 666 dev/null c 1 3
+          sudo mknod -m 666 dev/tty c 5 0
+          sudo sh -c "find . | cpio -o -H newc --owner 0:0 | gzip -9 > '$DIST/initramfs-${KVER}.cpio.gz'"
+
+          mkdir -p "$WORK/iso/boot/grub"
+          cp "$DIST/vmlinuz-${KVER}" "$WORK/iso/boot/vmlinuz"
+          cp "$DIST/initramfs-${KVER}.cpio.gz" "$WORK/iso/boot/initramfs.gz"
+          cat > "$WORK/iso/boot/grub/grub.cfg" <<EOF
+          serial --unit=0 --speed=115200
+          terminal_input serial console
+          terminal_output serial console
+          set timeout=3
+          menuentry "${NAME}" {
+            linux /boot/vmlinuz rdinit=/init console=tty0 console=ttyS0,115200
+            initrd /boot/initramfs.gz
+          }
+          EOF
+          sed -i 's/^ *//' "$WORK/iso/boot/grub/grub.cfg"
+          grub-mkrescue -o "$DIST/${NAME}.iso" "$WORK/iso"
+          ls -lah "$DIST"
+
+      - name: QEMU smoke test (login prompt gelmeli)
+        run: |
+          # systemd + RAM'deki kök dosya sistemi runit'e göre daha fazla bellek ve zaman ister
+          timeout 240 qemu-system-x86_64 -m 1024 -cpu max -accel tcg \
+            -kernel "$DIST/vmlinuz-${KVER}" \
+            -initrd "$DIST/initramfs-${KVER}.cpio.gz" \
+            -append "console=ttyS0 rdinit=/init panic=-1" \
+            -display none -serial stdio -monitor none -no-reboot \
+            > "$WORK/boot.log" 2>&1 || true
+          tail -n 60 "$WORK/boot.log"
+          grep -q "login:" "$WORK/boot.log"
+
+      - name: Artifact yükle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.distro_name }}-${{ inputs.kernel_version }}
+          path: |
+            dist/
+            work/boot.log
+
+      - name: GitHub Release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.distro_name }}-${{ github.run_number }}
+          name: ${{ inputs.distro_name }} (kernel ${{ inputs.kernel_version }})
+          files: |
+            dist/*.iso
+            dist/vmlinuz-*
+            dist/initramfs-*.cpio.gz
