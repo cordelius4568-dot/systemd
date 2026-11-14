@@ -123,6 +123,11 @@ jobs:
 
       - name: systemd fork'unu derle (init / servis yöneticisi)
         run: |
+          # Depo Windows/web arayüzü ile yüklendiyse çalıştırma izinleri (+x) kaybolur; meson'un çağırdığı
+          # betikler (ör. tools/generate-gperfs.py) "Permission denied" verir. İzinleri geri yükle.
+          find . \( -path ./work -o -path ./rootfs -o -path ./dist -o -path ./.git \) -prune -o \
+            -type f \( -name '*.py' -o -name '*.sh' -o -name '*.install' -o -name '*.install.in' \) \
+            -exec chmod +x {} +
           # Kaynak: bu depo (checkout). Gereksiz ve ağ/telemetriye açılan özellikler kapalı; man/test yok.
           meson setup "$WORK/build-systemd" "$GITHUB_WORKSPACE" \
             --buildtype=release \
